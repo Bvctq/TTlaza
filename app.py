@@ -1,119 +1,134 @@
 import os
+import hmac
+import hashlib
+import time
+import requests
 import re
-from urllib.parse import quote, urlparse
-
-# Sử dụng curl_cffi để giả lập TLS fingerprint của trình duyệt thật, vượt Cloudflare
-from curl_cffi import requests as cffi_requests
-from curl_cffi.requests.exceptions import RequestException
-from flask import Flask, request, jsonify, Response, stream_with_context
+from flask import Flask, request, jsonify
 from flask_cors import CORS
 
 app = Flask(__name__)
+CORS(app)  # Cho phép mọi domain gọi API, có thể hạn chế sau
 
-_origins_env = os.environ.get("ALLOWED_ORIGIN", "").strip()
-ALLOWED_ORIGINS = [o.strip() for o in _origins_env.split(",") if o.strip()] or "*"
-CORS(app, resources={r"/api/*": {"origins": ALLOWED_ORIGINS}})
+# ========== CẤU HÌNH TỪ BIẾN MÔI TRƯỜNG (set trên Render) ==========
+APP_KEY = os.getenv("LAZADA_APP_KEY")
+APP_SECRET = os.getenv("LAZADA_APP_SECRET")
+ACCESS_TOKEN = os.getenv("LAZADA_ACCESS_TOKEN")
+BASE_URL = os.getenv("LAZADA_BASE_URL", "https://api.lazada.vn/rest")  # mặc định VN
 
-BROWSER_HEADERS = {
-    "Accept": "application/json, text/javascript, */*; q=0.01",
-    "Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Referer": "https://svxtract.com/",
-    "X-Requested-With": "XMLHttpRequest"
-}
+if not APP_KEY or not APP_SECRET or not ACCESS_TOKEN:
+    raise RuntimeError("Missing Lazada API credentials. Set LAZADA_APP_KEY, LAZADA_APP_SECRET, LAZADA_ACCESS_TOKEN environment variables.")
 
+# ========== HÀM TẠO CHỮ KÝ ==========
+def generate_sign(params: dict) -> str:
+    sorted_keys = sorted(params.keys())
+    string_to_sign = ""
+    for key in sorted_keys:
+        string_to_sign += key + str(params[key])
+    string_to_sign = APP_SECRET + string_to_sign + APP_SECRET
+    sign = hmac.new(
+        APP_SECRET.encode('utf-8'),
+        string_to_sign.encode('utf-8'),
+        hashlib.sha256
+    ).hexdigest().upper()
+    return sign
 
-def sanitize_filename(name: str) -> str:
-    name = name or "video"
-    name = re.sub(r"[^a-zA-Z0-9_\-]", "_", name)
-    return name[:80] or "video"
-
-
-@app.get("/")
-def health():
-    return jsonify({"status": "ok"})
-
-
-@app.post("/api/fetch-video")
-def fetch_video():
-    data = request.get_json(silent=True) or {}
-    shopee_url = data.get("shopeeUrl")
-    csrf_token = data.get("csrfToken")
-
-    if not shopee_url or not csrf_token:
-        return jsonify({"error": "Thiếu link Shopee hoặc csrf_token."}), 400
-
-    api_url = (
-        "https://svxtract.com/apiv3.php?"
-        f"url={quote(shopee_url, safe='')}&csrf_token={quote(csrf_token, safe='')}"
-    )
-
-    try:
-        # Thêm impersonate="chrome124" để vượt Cloudflare TLS Fingerprint
-        upstream = cffi_requests.get(
-            api_url, 
-            headers=BROWSER_HEADERS, 
-            impersonate="chrome124", 
-            timeout=15
-        )
-    except RequestException as exc:
-        app.logger.warning("fetch-video request error: %s", exc)
-        return jsonify({"error": "Không kết nối được tới nguồn video. Thử lại sau."}), 500
-
-    if not upstream.ok:
-        return jsonify({
-            "error": f"Nguồn trả lỗi (HTTP {upstream.status_code}). bị Cloudflare chặn hoặc Token hết hạn."
-        }), 502
-
-    try:
-        payload = upstream.json()
-    except ValueError:
-        return jsonify({"error": "Nguồn trả về dữ liệu không hợp lệ (có thể dính trang thử thách Captcha của Cloudflare)."}), 502
-
-    if not payload.get("stream"):
-        return jsonify({"error": "Không nhận được dữ liệu video hợp lệ từ nguồn."}), 502
-
-    return jsonify(payload)
-
-
-@app.get("/api/download")
-def download():
-    url = request.args.get("url")
-    filename = request.args.get("filename", "video")
-
-    if not url:
-        return "Thiếu url", 400
-
-    host = urlparse(url).hostname
-    if host != "svxtract.com":
-        return "Chỉ cho phép tải từ svxtract.com", 400
-
-    try:
-        # Dùng impersonate cho cả tải video phòng trường hợp CDN chặn bot
-        upstream = cffi_requests.get(
-            url, 
-            headers=BROWSER_HEADERS, 
-            impersonate="chrome124",
-            stream=True, 
-            timeout=30
-        )
-    except RequestException:
-        return "Lỗi khi tải video.", 500
-
-    if not upstream.ok:
-        return "Không tải được video từ nguồn.", 502
-
-    def generate():
-        for chunk in upstream.iter_content(chunk_size=65536):
-            if chunk:
-                yield chunk
-
-    headers = {
-        "Content-Disposition": f'attachment; filename="{sanitize_filename(filename)}.mp4"',
-        "Content-Type": upstream.headers.get("content-type", "video/mp4"),
+# ========== GỌI LAZADA API ==========
+def call_lazada_api(api_path: str, extra_params: dict) -> dict:
+    params = {
+        'app_key': APP_KEY,
+        'timestamp': str(int(time.time() * 1000)),
+        'sign_method': 'sha256',
+        'access_token': ACCESS_TOKEN,
     }
-    return Response(stream_with_context(generate()), headers=headers)
+    params.update(extra_params)
+    params['sign'] = generate_sign(params)
 
+    url = BASE_URL + api_path
+    try:
+        response = requests.get(url, params=params, timeout=15)
+        return response.json()
+    except Exception as e:
+        return {'code': 'EXCEPTION', 'message': str(e)}
 
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+# ========== LẤY PRODUCT ID TỪ URL ==========
+def extract_product_id(url: str) -> str:
+    # Nếu là link rút gọn, follow redirect
+    if 's.lazada' in url or 's.lz' in url:
+        try:
+            r = requests.get(url, allow_redirects=True, timeout=10)
+            url = r.url
+        except:
+            pass
+
+    # Thử regex dạng -i{id}-s
+    match = re.search(r'-i(\d+)-s', url)
+    if match:
+        return match.group(1)
+
+    # Thử query params
+    match = re.search(r'[?&](?:id|productId)=(\d+)', url)
+    if match:
+        return match.group(1)
+
+    raise ValueError("Không tìm thấy productId trong link")
+
+# ========== API ENDPOINT ==========
+@app.route('/get-product', methods=['GET'])
+def get_product():
+    input_url = request.args.get('url')
+    if not input_url:
+        return jsonify({'error': 'Thiếu tham số url'}), 400
+
+    try:
+        product_id = extract_product_id(input_url)
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
+
+    # Gọi Lazada product feed
+    feed_result = call_lazada_api('/marketing/product/feed', {
+        'offerType': 1,          # 1 = thường, 2 = MM, 3 = DM
+        'productIds': f"[{product_id}]",
+        'limit': 10,
+        'page': 1
+    })
+
+    if feed_result.get('code') != '0':
+        return jsonify({
+            'error': 'Lỗi từ Lazada API',
+            'detail': feed_result.get('message', feed_result)
+        }), 500
+
+    products = feed_result.get('data', {}).get('products', [])
+    if not products:
+        return jsonify({'error': 'Không tìm thấy sản phẩm hoặc sản phẩm không thuộc chương trình affiliate'}), 404
+
+    product = products[0]
+
+    # Trích xuất thông tin cần thiết
+    # Lưu ý: tên trường có thể thay đổi, bạn có thể in thử response để điều chỉnh
+    result = {
+        'title': product.get('productName', ''),
+        'image': product.get('image', ''),
+        'price': product.get('salePrice', product.get('price', '')),
+        'original_price': product.get('price', ''),
+        'commission_rate': product.get('commissionRate', ''),
+        'product_id': product.get('productId', product_id)
+    }
+
+    # (Tùy chọn) Tạo link affiliate
+    link_result = call_lazada_api('/marketing/product/link', {'productId': product_id})
+    if link_result.get('code') == '0':
+        link_data = link_result.get('data', {})
+        result['affiliate_link'] = link_data.get('trackingLink', '')
+        # Có thể thêm thông tin hoa hồng từ link API nếu cần
+
+    return jsonify(result)
+
+# ========== HEALTH CHECK ==========
+@app.route('/', methods=['GET'])
+def health():
+    return jsonify({'status': 'ok', 'message': 'Lazada Affiliate API is running'})
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
